@@ -8,12 +8,12 @@
 
 ```
 1-start.txt → 1-end.txt → 1-自查 → 2-start.txt → 2-end.txt → 2-自查 → …
-   devin -p    devin -c -p  devin -c -p   devin -c -p   devin -c -p   devin -c -p
-   └────────────────── 同一个会话（上下文累积）──────────────────┘
+   devin -p    devin -r $SID -p（后续每步同）——同一个会话，上下文累积
 ```
 
-- 第一步 `devin -p` 在当前目录开新会话
-- 之后每步 `devin -c -p` 续"本目录最近会话"——第 12 组也能看到第 1 组干的活
+- 第一步 `devin -p` 在当前目录开新会话，随即用 `devin list` 抓到会话 ID（SID）
+- 之后每步 `devin -r $SID -p` **精确**续同一会话——不用 `-c`，它只猜"本目录最近会话"，跑批期间同目录开别的 devin 会接错
+- devin 的 stdin 一律 `</dev/null` 隔离（`devin -p` 会消费管道 stdin，不隔离会吃掉脚本自己的 heredoc 队列输入——实测复现过）
 - 自查轮让模型自己检查遗漏并补做（见下文）
 
 ## 环境要求
@@ -81,7 +81,7 @@ QUEUE_MODEL=opus QUEUE_PERM=accept-edits QUEUE_TRUST=false run-queue.sh prompts
 
 | 变量 | 说明 |
 |---|---|
-| `QUEUE_MODEL` | 传给 `devin --model`。注意：`-c` 续会话时 model 语义是"给该会话切模型"，不传则沿用会话原有模型 |
+| `QUEUE_MODEL` | 传给 `devin --model`。注意：`-r`/`-c` 续会话时 model 语义是"给该会话切模型"，不传则沿用会话原有模型 |
 | `QUEUE_PERM` | 传给 `--permission-mode`。**不设时启动会弹菜单选**，预设则跳过菜单 |
 | `QUEUE_TRUST=false` | 传 `--respect-workspace-trust false`。-p 非交互模式遇到未信任目录**不会弹确认而是直接失败**，新项目目录必设 |
 | `QUEUE_SANDBOX=1` | 传 `--sandbox`，exec 进程沙箱化（只能写工作区）。配合 `dangerous` 是"放手但不裸奔"的推荐组合 |
@@ -145,14 +145,17 @@ QUEUE_MODEL=opus QUEUE_PERM=accept-edits QUEUE_TRUST=false run-queue.sh prompts
 每次运行在 `logs/<时间戳>/` 下：
 
 ```
-logs/20261109-220022/
+logs/20261109-220022-12345/
   stats.jsonl        每步一行：{"step":"1-end","kind":"end","start":…,"end":…,"secs":47,"exit":0,"verdict":"-"}
+                     （催办轮单独一行 kind:"check-retry"）
   step-1-start.out   每步的完整 stdout
   step-1-check.out.retry   催办轮输出（如有）
   _inline-1-check.txt      实际发送的自查 prompt 存档
-  export-*.json      devin --export 导出的会话（最后一份即全量会话内容）
+  export-*.json      devin --export 导出的会话（非 --fresh 时最后一份即全量）
   done.steps         已完成步骤清单（--resume 依据）
-  session.id         队列会话 ID
+  prompts.path       本 run 的 prompts 目录（resume 只认同目录的 run）
+  session.ids        "步骤 会话ID" 逐行记录（--fresh 每组一行）
+  session.id         最后会话 ID（快捷文件，等价 session.ids 尾行）
 ```
 
 - **逐条计时**：`stats.jsonl` 的 `secs` 是 wall-clock 秒数；要 token 级速度需另配 devin OTel（`api_request.duration_ms`），脚本不管
@@ -175,9 +178,10 @@ devin list                      # 或先看列表再选
 run-queue.sh prompts --resume
 ```
 
-- 读最近一次 run（`logs/` 下最新的含 `done.steps` 的目录）的完成清单，已完成的 `N-start/N-end/N-check` 跳过
-- 续跑用 `devin -c -p` 接同一会话——前提是该会话仍是本目录最近的（期间别在同目录跑别的 devin）
-- 注意：续跑会新建本次的日志目录，`session.id` 不变（还是同一会话）
+- 在 `logs/` 里找最近一次**同 prompts 目录**（按 `prompts.path` 匹配）且 `done.steps` 非空的 run，已完成的步骤跳过——跨队列不会误跳
+- 续跑用 `devin -r $SID -p` 精确接回会话（SID 从上次的 `session.ids` 恢复），不猜"最近会话"
+- `--fresh` 时按组号取各组自己的 SID；非 fresh 全队列共享一个
+- `-r` 目标会话被删/锁会自动熔断：重置为新会话重试本步
 
 ## 典型用法
 
@@ -214,15 +218,15 @@ run-queue.sh prompts --fresh   # 每组新会话，组内仍共享
 |---|---|
 | 第一步就失败、报 trust 相关 | 目录未信任：`QUEUE_TRUST=false` 重跑，或先 `devin` 进交互模式信任一次 |
 | 卡住不动、无输出 | 多半是权限审批在等非交互给不了的确认：加 `QUEUE_PERM=accept-edits` |
-| `--resume` 没跳过已完成步骤 | 找不到 `done.steps`（换过日志目录/手动删过）→ 从头跑 |
-| 续上的会话内容不对 | `-c` 接了错误的最近会话（跑批期间同目录开过别的 devin）→ 改用 `devin -r <session.id>` 手动确认 |
+| `--resume` 没跳过已完成步骤 | 找不到**同 prompts 目录**且非空的 `done.steps` → 从头跑；检查 `prompts.path` 是否匹配 |
+| 续上的会话内容不对 | `session.ids` 里的 SID 已删/被锁 → `-r` 失败会自动熔断开新会话；要回旧会话用 `devin -r <session.ids里的id>` 手动接 |
 | `needs_review` 一堆 | 自查 prompt 与你的任务不匹配 → 用 `QUEUE_CHECK_PROMPT` 调整判定词 |
 | 控制键没反应 | 无 TTY 环境（管道/cron），控制键不可用属正常 |
 
 ## 已知限制
 
 - **自查是同会话 self-review**：模型容易"觉得自己没问题"。要严格把关需换异构评审（另一会话/另一模型），那是 acp 脚本或插件层的活
-- **会话定位靠"最近"**：`-c`/session.id 都基于"本目录最近会话"，跑批期间同目录开 devin 会错位
+- **SID 首抓依赖"最近活跃"兜底**：正常路径从本步 `export-*.json` 的 `session_id` 读（零竞态）；仅当 export 缺该字段才回落 `devin list`——此刻若同目录有别的新会话可能抓错，但只影响兜底路径
 - **速度统计只有 wall-clock**：tokens/s 要配 devin OTel collector
 - **失败步不阻塞**：某步非零退出只记录继续跑（模型任务失败多是"没干完"而非崩溃），要严格的 fail-fast 可在 `run_devin` 返回后加退出逻辑
 
@@ -233,6 +237,7 @@ devin-queue/
   run-queue.sh        主脚本
   README.md           本文档
   prompts-example/    示例任务（1/2 两组，可直接 --list 看效果）
-  prompts/            你的任务放这里（默认目录）
-  logs/               运行产物
+  prompts/            你的任务放这里（默认目录，已 gitignore）
+  audit/              本项目自审计报告（devin-queue 审计 devin-queue 的产出）
+  logs/               运行产物（已 gitignore）
 ```
