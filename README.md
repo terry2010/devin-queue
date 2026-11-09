@@ -82,10 +82,29 @@ QUEUE_MODEL=opus QUEUE_PERM=accept-edits QUEUE_TRUST=false run-queue.sh prompts
 | 变量 | 说明 |
 |---|---|
 | `QUEUE_MODEL` | 传给 `devin --model`。注意：`-c` 续会话时 model 语义是"给该会话切模型"，不传则沿用会话原有模型 |
-| `QUEUE_PERM` | 传给 `--permission-mode`。**无人值守建议 `accept-edits` 或 `dangerous`**，否则模型每步停下来等权限审批，队列会卡住 |
+| `QUEUE_PERM` | 传给 `--permission-mode`。**不设时启动会弹菜单选**，预设则跳过菜单 |
 | `QUEUE_TRUST=false` | 传 `--respect-workspace-trust false`。-p 非交互模式遇到未信任目录**不会弹确认而是直接失败**，新项目目录必设 |
+| `QUEUE_SANDBOX=1` | 传 `--sandbox`，exec 进程沙箱化（只能写工作区）。配合 `dangerous` 是"放手但不裸奔"的推荐组合 |
 | `QUEUE_CHECK=0` | 同 `--no-check` |
 | `QUEUE_CHECK_PROMPT` | 自定义自查 prompt（见下节） |
+
+## 权限模式
+
+不设 `QUEUE_PERM` 时，启动在确认前会弹菜单：
+
+```
+权限模式：
+  1) auto             只自动批准只读工具（改文件会停下来等审批）
+  2) accept-edits     + 自动批准工作区文件编辑
+  3) smart            + 快模型判定安全的动作自动执行（推荐）
+  4) dangerous        全部工具自动批准（bypass，无人值守）
+  5) dangerous+沙箱   同 4，但 exec 只能写工作区（无人值守推荐）
+选择 [1-5，默认3]:
+```
+
+四档含义：`auto`（默认，只读）→ `accept-edits`（+文件编辑）→ `smart`（+快模型判定安全）→ `dangerous`（全部批准 = bypass）。**无人值守跑批务必选 4 或 5**，或预设 `QUEUE_PERM=dangerous` 跳过菜单——否则 exec 审批会卡住队列。选 5 是"放手但不裸奔"：exec 被沙箱限制只能写工作区。
+
+非交互环境（cron/nohup）不设 `QUEUE_PERM` 不会弹菜单，回落到 devin 默认 auto 并打警告。
 
 ## 自查轮机制
 

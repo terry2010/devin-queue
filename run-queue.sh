@@ -8,8 +8,9 @@
 #
 # 环境变量：
 #   QUEUE_MODEL         传给 devin --model
-#   QUEUE_PERM          传给 --permission-mode（无人值守建议 accept-edits / dangerous）
+#   QUEUE_PERM          预设 --permission-mode（不设则启动时弹菜单选择）
 #   QUEUE_TRUST=false   目录未被信任时跳过 workspace trust 检查（-p 模式遇未信任目录会直接失败）
+#   QUEUE_SANDBOX=1     传 --sandbox，exec 命令沙箱化只能写工作区（配合 QUEUE_PERM=dangerous 更稳）
 #   QUEUE_CHECK=0       跳过每对任务后的自查轮（等同 --no-check）
 #   QUEUE_CHECK_PROMPT  自定义自查 prompt
 #
@@ -86,6 +87,35 @@ if [ "$RESUME" = 1 ]; then
   [ -z "$RESUME_DONE" ] && echo "⚠ 没找到可续跑的 done.steps，从头执行" >&2
 fi
 
+# ---------- 权限模式 ----------
+PERM="${QUEUE_PERM:-}"
+SANDBOX="${QUEUE_SANDBOX:-0}"
+if [ -z "$PERM" ]; then
+  if [ -r /dev/tty ]; then
+    cat > /dev/tty <<'EOF'
+权限模式：
+  1) auto             只自动批准只读工具（改文件会停下来等审批）
+  2) accept-edits     + 自动批准工作区文件编辑
+  3) smart            + 快模型判定安全的动作自动执行（推荐）
+  4) dangerous        全部工具自动批准（bypass，无人值守）
+  5) dangerous+沙箱   同 4，但 exec 只能写工作区（无人值守推荐）
+EOF
+    printf '选择 [1-5，默认3]: ' > /dev/tty
+    read -r pc < /dev/tty || pc=""
+    case "$pc" in
+      1|auto)         PERM="auto" ;;
+      2|accept-edits) PERM="accept-edits" ;;
+      4|dangerous)    PERM="dangerous" ;;
+      5)              PERM="dangerous"; SANDBOX=1 ;;
+      ""|3|smart)     PERM="smart" ;;
+      *) echo "无效选择，使用 smart" > /dev/tty; PERM="smart" ;;
+    esac
+  else
+    echo "⚠ 非交互环境且未设 QUEUE_PERM，devin 用默认 auto 档（可能卡在审批）" >&2
+  fi
+fi
+[ -n "$PERM" ] && echo "权限模式: $PERM$([ "$SANDBOX" = 1 ] && echo ' + sandbox')"
+
 # ---------- 确认 ----------
 if [ "$ASSUME_YES" != 1 ]; then
   printf '开始执行？[y/N] ' > /dev/tty
@@ -104,7 +134,7 @@ TTY_OK=0; STTY_SAVED=""
 if exec 9</dev/tty 2>/dev/null; then
   TTY_OK=1
   STTY_SAVED=$(stty -g </dev/tty 2>/dev/null || true)
-  stty -icanon -echo min 0 time 0 </dev/tty 2>/dev/null || true
+  stty -icanon -echo </dev/tty 2>/dev/null || true
 fi
 STOP_AFTER=0; CUR_PID=""
 cleanup() {
@@ -113,13 +143,14 @@ cleanup() {
 }
 trap 'cleanup; echo; echo "✗ 已中断（当前步未完成），续跑: --resume"; exit 130' INT
 trap 'cleanup' EXIT
-poll_key() { local k=""; [ "$TTY_OK" = 1 ] && IFS= read -r -n 1 k <&9 2>/dev/null; printf '%s' "$k"; }
+poll_key() { local k=""; [ "$TTY_OK" = 1 ] && IFS= read -t 0.2 -r -n 1 k <&9 2>/dev/null; printf '%s' "$k"; }
 
 # ---------- devin 调用 ----------
 DEVIN_ARGS=""
 [ -n "${QUEUE_MODEL:-}" ] && DEVIN_ARGS="$DEVIN_ARGS --model $QUEUE_MODEL"
-[ -n "${QUEUE_PERM:-}" ]  && DEVIN_ARGS="$DEVIN_ARGS --permission-mode $QUEUE_PERM"
+[ -n "$PERM" ] && DEVIN_ARGS="$DEVIN_ARGS --permission-mode $PERM"
 [ "${QUEUE_TRUST:-true}" = "false" ] && DEVIN_ARGS="$DEVIN_ARGS --respect-workspace-trust false"
+[ "$SANDBOX" = "1" ] && DEVIN_ARGS="$DEVIN_ARGS --sandbox"
 FIRST_STEP=1
 [ "$RESUME" = 1 ] && [ -n "$RESUME_DONE" ] && FIRST_STEP=0   # 续跑接同一会话
 
@@ -128,14 +159,17 @@ run_devin() {  # $1=key $2=prompt文件 $3=out文件
   if [ "$FIRST_STEP" = 1 ]; then args="-p"; else args="-c -p"; fi
   devin $args $DEVIN_ARGS --export "$LOGDIR/export-$label.json" --prompt-file "$src" > "$out" 2>&1 &
   CUR_PID=$!; t0=$SECONDS
-  while kill -0 "$CUR_PID" 2>/dev/null; do
+  while :; do
+    local st; st=$(ps -p "$CUR_PID" -o stat= 2>/dev/null)
+    [ -z "$st" ] && break          # 进程已回收
+    case "$st" in *Z*) break ;; esac  # 僵尸：kill -0 仍会成功，必须单独判
+    sleep 1; printf '\r    ⏱ %ds' "$((SECONDS-t0))" >&2
     k=$(poll_key)
     case "$k" in
       q) STOP_AFTER=1; echo >&2; echo "⏸  收到 q：本步完成后退出" >&2 ;;
       x) echo >&2; echo "✗ 收到 x：立即退出" >&2
          kill "$CUR_PID" 2>/dev/null; wait "$CUR_PID" 2>/dev/null; CUR_PID=""; cleanup; exit 130 ;;
     esac
-    sleep 1; printf '\r    ⏱ %ds' "$((SECONDS-t0))" >&2
   done
   printf '\r        \r' >&2
   wait "$CUR_PID"; rc=$?; CUR_PID=""
